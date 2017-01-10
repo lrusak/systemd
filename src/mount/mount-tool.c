@@ -35,11 +35,10 @@
 #include "udev-util.h"
 #include "unit-name.h"
 #include "terminal-util.h"
+#include "verbs.h"
 
 enum {
         ACTION_DEFAULT,
-        ACTION_MOUNT,
-        ACTION_AUTOMOUNT,
         ACTION_LIST,
 } arg_action = ACTION_DEFAULT;
 
@@ -76,7 +75,7 @@ static void polkit_agent_open_if_enabled(void) {
 }
 
 static void help(void) {
-        printf("%s [OPTIONS...] WHAT [WHERE]\n\n"
+        printf("%s [OPTIONS...] {COMMAND} ...\n\n"
                "Establish a mount or auto-mount point transiently.\n\n"
                "  -h --help                       Show this help\n"
                "     --version                    Show package version\n"
@@ -93,13 +92,15 @@ static void help(void) {
                "     --fsck=no                    Don't run file system check before mount\n"
                "     --description=TEXT           Description for unit\n"
                "  -p --property=NAME=VALUE        Set mount unit property\n"
-               "  -A --automount=BOOL             Create an auto-mount point\n"
                "     --timeout-idle-sec=SEC       Specify automount idle timeout\n"
                "     --automount-property=NAME=VALUE\n"
                "                                  Set automount unit property\n"
                "     --bind-device                Bind automount unit to device\n"
-               "     --list                       List mountable block devices\n"
-               , program_invocation_short_name);
+               "     --list                       List mountable block devices\n\n"
+               "Commands:\n"
+               "  mount WHAT [WHERE]              Establish a mount point transiently\n"
+               "  automount WHAT [WHERE]          Establish an auto-mount point transiently\n",
+               program_invocation_short_name);
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -117,7 +118,6 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_FSCK,
                 ARG_DESCRIPTION,
                 ARG_TIMEOUT_IDLE,
-                ARG_AUTOMOUNT,
                 ARG_AUTOMOUNT_PROPERTY,
                 ARG_BIND_DEVICE,
                 ARG_LIST,
@@ -139,7 +139,6 @@ static int parse_argv(int argc, char *argv[]) {
                 { "options",            required_argument, NULL, 'o'                    },
                 { "description",        required_argument, NULL, ARG_DESCRIPTION        },
                 { "property",           required_argument, NULL, 'p'                    },
-                { "automount",          required_argument, NULL, ARG_AUTOMOUNT          },
                 { "timeout-idle-sec",   required_argument, NULL, ARG_TIMEOUT_IDLE       },
                 { "automount-property", required_argument, NULL, ARG_AUTOMOUNT_PROPERTY },
                 { "bind-device",        no_argument,       NULL, ARG_BIND_DEVICE        },
@@ -230,18 +229,6 @@ static int parse_argv(int argc, char *argv[]) {
 
                         break;
 
-                case 'A':
-                        arg_action = ACTION_AUTOMOUNT;
-                        break;
-
-                case ARG_AUTOMOUNT:
-                        r = parse_boolean(optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "--automount= expects a valid boolean parameter: %s", optarg);
-
-                        arg_action = r ? ACTION_AUTOMOUNT : ACTION_MOUNT;
-                        break;
-
                 case ARG_TIMEOUT_IDLE:
                         r = parse_sec(optarg, &arg_timeout_idle);
                         if (r < 0)
@@ -283,32 +270,6 @@ static int parse_argv(int argc, char *argv[]) {
 
                 if (arg_transport != BUS_TRANSPORT_LOCAL) {
                         log_error("Listing devices only supported locally.");
-                        return -EOPNOTSUPP;
-                }
-        } else {
-                if (optind >= argc) {
-                        log_error("At least one argument required.");
-                        return -EINVAL;
-                }
-
-                if (argc > optind+2) {
-                        log_error("At most two arguments required.");
-                        return -EINVAL;
-                }
-
-                arg_mount_what = fstab_node_to_udev_node(argv[optind]);
-                if (!arg_mount_what)
-                        return log_oom();
-
-                if (argc > optind+1) {
-                        r = path_make_absolute_cwd(argv[optind+1], &arg_mount_where);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to make path absolute: %m");
-                } else
-                        arg_discover = true;
-
-                if (arg_discover && arg_transport != BUS_TRANSPORT_LOCAL) {
-                        log_error("Automatic mount location discovery is only supported locally.");
                         return -EOPNOTSUPP;
                 }
         }
@@ -409,20 +370,311 @@ static int transient_automount_set_properties(sd_bus_message *m) {
         return 0;
 }
 
-static int start_transient_mount(
-                sd_bus *bus,
-                char **argv) {
+static int acquire_mount_type(struct udev_device *d) {
+        const char *v;
 
+        assert(d);
+
+        if (arg_mount_type)
+                return 0;
+
+        v = udev_device_get_property_value(d, "ID_FS_TYPE");
+        if (isempty(v))
+                return 0;
+
+        arg_mount_type = strdup(v);
+        if (!arg_mount_type)
+                return log_oom();
+
+        log_debug("Discovered type=%s", arg_mount_type);
+        return 1;
+}
+
+static int acquire_mount_options(struct udev_device *d) {
+        const char *v;
+
+        if (arg_mount_options)
+                return 0;
+
+        v = udev_device_get_property_value(d, "SYSTEMD_MOUNT_OPTIONS");
+        if (isempty(v))
+                return 0;
+
+        arg_mount_options = strdup(v);
+        if (!arg_mount_options)
+                return log_oom();
+
+        log_debug("Discovered options=%s", arg_mount_options);
+        return 1;
+}
+
+static const char *get_model(struct udev_device *d) {
+        const char *model;
+
+        assert(d);
+
+        model = udev_device_get_property_value(d, "ID_MODEL_FROM_DATABASE");
+        if (model)
+                return model;
+
+        return udev_device_get_property_value(d, "ID_MODEL");
+}
+
+static const char* get_label(struct udev_device *d) {
+        const char *label;
+
+        assert(d);
+
+        label = udev_device_get_property_value(d, "ID_FS_LABEL");
+        if (label)
+                return label;
+
+        return udev_device_get_property_value(d, "ID_PART_ENTRY_NAME");
+}
+
+static int acquire_mount_where(struct udev_device *d) {
+        const char *v;
+
+        if (arg_mount_where)
+                return 0;
+
+        v = udev_device_get_property_value(d, "SYSTEMD_MOUNT_WHERE");
+        if (isempty(v)) {
+                _cleanup_free_ char *escaped = NULL;
+                const char *name;
+
+                name = get_label(d);
+                if (!name)
+                        name = get_model(d);
+                if (!name) {
+                        const char *dn;
+
+                        dn = udev_device_get_devnode(d);
+                        if (!dn)
+                                return 0;
+
+                        name = basename(dn);
+                }
+
+                escaped = xescape(name, "\\");
+                if (!filename_is_valid(escaped))
+                        return 0;
+                arg_mount_where = strjoin("/run/media/system/", escaped, NULL);
+        } else
+                arg_mount_where = strdup(v);
+
+        if (!arg_mount_where)
+                return log_oom();
+
+        log_debug("Discovered where=%s", arg_mount_where);
+        return 1;
+}
+
+static int acquire_description(struct udev_device *d) {
+        const char *model, *label;
+
+        if (arg_description)
+                return 0;
+
+        model = get_model(d);
+
+        label = get_label(d);
+        if (!label)
+                label = udev_device_get_property_value(d, "ID_PART_ENTRY_NUMBER");
+
+        if (model && label)
+                arg_description = strjoin(model, " ", label, NULL);
+        else if (label)
+                arg_description = strdup(label);
+        else if (model)
+                arg_description = strdup(model);
+        else
+                return 0;
+
+        if (!arg_description)
+                return log_oom();
+
+        log_debug("Discovered description=%s", arg_description);
+        return 1;
+}
+
+static int acquire_removable(struct udev_device *d) {
+        const char *v;
+
+        /* Shortcut this if there's no reason to check it */
+        if (arg_action != ACTION_DEFAULT && arg_timeout_idle_set && arg_bind_device >= 0)
+                return 0;
+
+        for (;;) {
+                v = udev_device_get_sysattr_value(d, "removable");
+                if (v)
+                        break;
+
+                d = udev_device_get_parent(d);
+                if (!d)
+                        return 0;
+
+                if (!streq_ptr(udev_device_get_subsystem(d), "block"))
+                        return 0;
+        }
+
+        if (parse_boolean(v) <= 0)
+                return 0;
+
+        log_debug("Discovered removable device.");
+
+        if (!arg_timeout_idle_set) {
+                log_debug("Setting idle timeout to 1s.");
+                arg_timeout_idle = USEC_PER_SEC;
+        }
+
+        if (arg_bind_device < 0) {
+                log_debug("Binding automount unit to device.");
+                arg_bind_device = true;
+        }
+
+        return 1;
+}
+
+static int discover_device(void) {
+        _cleanup_udev_device_unref_ struct udev_device *d = NULL;
+        _cleanup_udev_unref_ struct udev *udev = NULL;
+        struct stat st;
+        const char *v;
+        int r;
+
+        if (!arg_discover)
+                return 0;
+
+        if (!is_device_path(arg_mount_what)) {
+                log_error("Discovery only supported for block devices, don't know what to do.");
+                return -EINVAL;
+        }
+
+        if (stat(arg_mount_what, &st) < 0)
+                return log_error_errno(errno, "Can't stat %s: %m", arg_mount_what);
+
+        if (!S_ISBLK(st.st_mode)) {
+                log_error("Path %s is not a block device, don't know what to do.", arg_mount_what);
+                return -ENOTBLK;
+        }
+
+        udev = udev_new();
+        if (!udev)
+                return log_oom();
+
+        d = udev_device_new_from_devnum(udev, 'b', st.st_rdev);
+        if (!d)
+                return log_oom();
+
+        v = udev_device_get_property_value(d, "ID_FS_USAGE");
+        if (!streq_ptr(v, "filesystem")) {
+                log_error("%s does not contain a file system.", arg_mount_what);
+                return -EINVAL;
+        }
+
+        r = acquire_mount_type(d);
+        if (r < 0)
+                return r;
+
+        r = acquire_mount_options(d);
+        if (r < 0)
+                return r;
+
+        r = acquire_mount_where(d);
+        if (r < 0)
+                return r;
+
+        r = acquire_description(d);
+        if (r < 0)
+                return r;
+
+        r = acquire_removable(d);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
+static int get_mount_options(int argc, char *argv[]) {
+
+        int r;
+        int optind = 1;
+
+        arg_mount_what = fstab_node_to_udev_node(argv[optind]);
+        if (!arg_mount_what)
+                return log_oom();
+
+        if (argc > optind+1) {
+                r = path_make_absolute_cwd(argv[optind+1], &arg_mount_where);
+                if (r < 0)
+                         return log_error_errno(r, "Failed to make path absolute: %m");
+        } else
+                arg_discover = true;
+
+        if (arg_discover && arg_transport != BUS_TRANSPORT_LOCAL) {
+                log_error("Automatic mount location discovery is only supported locally.");
+                return -EOPNOTSUPP;
+        }
+
+        r = discover_device();
+        if (r < 0)
+                return r;
+        if (!arg_mount_where) {
+                log_error("Can't figure out where to mount %s.", arg_mount_what);
+                return -EINVAL;
+        }
+
+        path_kill_slashes(arg_mount_where);
+
+        if (path_equal(arg_mount_where, "/")) {
+                log_error("Refusing to operate on root directory.");
+                return -EINVAL;
+        }
+
+        if (!path_is_safe(arg_mount_where)) {
+                log_error("Path is contains unsafe components.");
+                return -EINVAL;
+        }
+
+        if (streq_ptr(arg_mount_type, "auto"))
+                arg_mount_type = mfree(arg_mount_type);
+        if (streq_ptr(arg_mount_options, "defaults"))
+                arg_mount_options = mfree(arg_mount_options);
+
+        if (!is_device_path(arg_mount_what))
+                arg_fsck = false;
+
+        if (arg_fsck && arg_mount_type && arg_transport == BUS_TRANSPORT_LOCAL) {
+                r = fsck_exists(arg_mount_type);
+                if (r < 0)
+                        log_warning_errno(r, "Couldn't determine whether fsck for %s exists, proceeding anyway.", arg_mount_type);
+        else if (r == 0) {
+                log_debug("Disabling file system check as fsck for %s doesn't exist.", arg_mount_type);
+                arg_fsck = false; /* fsck doesn't exist, let's not attempt it */
+                }
+        }
+
+        return 0;
+}
+
+static int start_transient_mount(int argc, char *argv[], void *userdata) {
+
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(bus_wait_for_jobs_freep) BusWaitForJobs *w = NULL;
         _cleanup_free_ char *mount_unit = NULL;
         int r;
 
-        if (!arg_no_block) {
-                r = bus_wait_for_jobs_new(bus, &w);
-                if (r < 0)
-                        return log_error_errno(r, "Could not watch jobs: %m");
+        r = get_mount_options(argc, argv);
+        if (r < 0)
+                return r;
+
+        r = bus_connect_transport_systemd(arg_transport, arg_host, arg_user, &bus);
+        if (r < 0) {
+                log_error_errno(r, "Failed to create bus connection: %m");
+                return r;
         }
 
         r = unit_name_from_path(arg_mount_where, ".mount", &mount_unit);
@@ -489,18 +741,29 @@ static int start_transient_mount(
                          ansi_highlight(), mount_unit, ansi_normal(),
                          ansi_highlight(), arg_mount_where, ansi_normal());
 
+        bus = sd_bus_flush_close_unref(bus);
+
         return 0;
 }
 
-static int start_transient_automount(
-                sd_bus *bus,
-                char **argv) {
+static int start_transient_automount(int argc, char *argv[], void *userdata) {
 
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(bus_wait_for_jobs_freep) BusWaitForJobs *w = NULL;
         _cleanup_free_ char *automount_unit = NULL, *mount_unit = NULL;
         int r;
+
+        r = get_mount_options(argc, argv);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get mount options");
+
+        r = bus_connect_transport_systemd(arg_transport, arg_host, arg_user, &bus);
+        if (r < 0) {
+                log_error_errno(r, "Failed to create bus connection: %m");
+                return r;
+        }
 
         if (!arg_no_block) {
                 r = bus_wait_for_jobs_new(bus, &w);
@@ -604,237 +867,7 @@ static int start_transient_automount(
                          ansi_highlight(), automount_unit, ansi_normal(),
                          ansi_highlight(), arg_mount_where, ansi_normal());
 
-        return 0;
-}
-
-static int acquire_mount_type(struct udev_device *d) {
-        const char *v;
-
-        assert(d);
-
-        if (arg_mount_type)
-                return 0;
-
-        v = udev_device_get_property_value(d, "ID_FS_TYPE");
-        if (isempty(v))
-                return 0;
-
-        arg_mount_type = strdup(v);
-        if (!arg_mount_type)
-                return log_oom();
-
-        log_debug("Discovered type=%s", arg_mount_type);
-        return 1;
-}
-
-static int acquire_mount_options(struct udev_device *d) {
-        const char *v;
-
-        if (arg_mount_options)
-                return 0;
-
-        v = udev_device_get_property_value(d, "SYSTEMD_MOUNT_OPTIONS");
-        if (isempty(v))
-                return 0;
-
-        arg_mount_options = strdup(v);
-        if (!arg_mount_options)
-                return log_oom();
-
-        log_debug("Discovered options=%s", arg_mount_options);
-        return 1;
-}
-
-static const char *get_model(struct udev_device *d) {
-        const char *model;
-
-        assert(d);
-
-        model = udev_device_get_property_value(d, "ID_MODEL_FROM_DATABASE");
-        if (model)
-                return model;
-
-        return udev_device_get_property_value(d, "ID_MODEL");
-}
-
-static const char* get_label(struct udev_device *d) {
-        const char *label;
-
-        assert(d);
-
-        label = udev_device_get_property_value(d, "ID_FS_LABEL");
-        if (label)
-                return label;
-
-        return udev_device_get_property_value(d, "ID_PART_ENTRY_NAME");
-}
-
-static int acquire_mount_where(struct udev_device *d) {
-        const char *v;
-
-        if (arg_mount_where)
-                return 0;
-
-        v = udev_device_get_property_value(d, "SYSTEMD_MOUNT_WHERE");
-        if (isempty(v)) {
-                _cleanup_free_ char *escaped = NULL;
-                const char *name;
-
-                name = get_label(d);
-                if (!name)
-                        name = get_model(d);
-                if (!name) {
-                        const char *dn;
-
-                        dn = udev_device_get_devnode(d);
-                        if (!dn)
-                                return 0;
-
-                        name = basename(dn);
-                }
-
-                escaped = xescape(name, "\\");
-                if (!filename_is_valid(escaped))
-                        return 0;
-
-                arg_mount_where = strjoin("/run/media/system/", escaped, NULL);
-        } else
-                arg_mount_where = strdup(v);
-
-        if (!arg_mount_where)
-                return log_oom();
-
-        log_debug("Discovered where=%s", arg_mount_where);
-        return 1;
-}
-
-static int acquire_description(struct udev_device *d) {
-        const char *model, *label;
-
-        if (arg_description)
-                return 0;
-
-        model = get_model(d);
-
-        label = get_label(d);
-        if (!label)
-                label = udev_device_get_property_value(d, "ID_PART_ENTRY_NUMBER");
-
-        if (model && label)
-                arg_description = strjoin(model, " ", label, NULL);
-        else if (label)
-                arg_description = strdup(label);
-        else if (model)
-                arg_description = strdup(model);
-        else
-                return 0;
-
-        if (!arg_description)
-                return log_oom();
-
-        log_debug("Discovered description=%s", arg_description);
-        return 1;
-}
-
-static int acquire_removable(struct udev_device *d) {
-        const char *v;
-
-        /* Shortcut this if there's no reason to check it */
-        if (arg_action != ACTION_DEFAULT && arg_timeout_idle_set && arg_bind_device >= 0)
-                return 0;
-
-        for (;;) {
-                v = udev_device_get_sysattr_value(d, "removable");
-                if (v)
-                        break;
-
-                d = udev_device_get_parent(d);
-                if (!d)
-                        return 0;
-
-                if (!streq_ptr(udev_device_get_subsystem(d), "block"))
-                        return 0;
-        }
-
-        if (parse_boolean(v) <= 0)
-                return 0;
-
-        log_debug("Discovered removable device.");
-
-        if (arg_action == ACTION_DEFAULT) {
-                log_debug("Automatically turning on automount.");
-                arg_action = ACTION_AUTOMOUNT;
-        }
-
-        if (!arg_timeout_idle_set) {
-                log_debug("Setting idle timeout to 1s.");
-                arg_timeout_idle = USEC_PER_SEC;
-        }
-
-        if (arg_bind_device < 0) {
-                log_debug("Binding automount unit to device.");
-                arg_bind_device = true;
-        }
-
-        return 1;
-}
-
-static int discover_device(void) {
-        _cleanup_udev_device_unref_ struct udev_device *d = NULL;
-        _cleanup_udev_unref_ struct udev *udev = NULL;
-        struct stat st;
-        const char *v;
-        int r;
-
-        if (!arg_discover)
-                return 0;
-
-        if (!is_device_path(arg_mount_what)) {
-                log_error("Discovery only supported for block devices, don't know what to do.");
-                return -EINVAL;
-        }
-
-        if (stat(arg_mount_what, &st) < 0)
-                return log_error_errno(errno, "Can't stat %s: %m", arg_mount_what);
-
-        if (!S_ISBLK(st.st_mode)) {
-                log_error("Path %s is not a block device, don't know what to do.", arg_mount_what);
-                return -ENOTBLK;
-        }
-
-        udev = udev_new();
-        if (!udev)
-                return log_oom();
-
-        d = udev_device_new_from_devnum(udev, 'b', st.st_rdev);
-        if (!d)
-                return log_oom();
-
-        v = udev_device_get_property_value(d, "ID_FS_USAGE");
-        if (!streq_ptr(v, "filesystem")) {
-                log_error("%s does not contain a file system.", arg_mount_what);
-                return -EINVAL;
-        }
-
-        r = acquire_mount_type(d);
-        if (r < 0)
-                return r;
-
-        r = acquire_mount_options(d);
-        if (r < 0)
-                return r;
-
-        r = acquire_mount_where(d);
-        if (r < 0)
-                return r;
-
-        r = acquire_description(d);
-        if (r < 0)
-                return r;
-
-        r = acquire_removable(d);
-        if (r < 0)
-                return r;
+        bus = sd_bus_flush_close_unref(bus);
 
         return 0;
 }
@@ -1019,8 +1052,18 @@ finish:
         return r;
 }
 
+static int systemd_mount_main(int argc, char *argv[]) {
+
+        static const Verb verbs[] = {
+                { "mount",        2, 3, VERB_NOCHROOT, start_transient_mount     },
+                { "automount",    2, 3, VERB_NOCHROOT, start_transient_automount },
+                {}
+        };
+
+        return dispatch_verb(argc, argv, verbs, NULL);
+}
+
 int main(int argc, char* argv[]) {
-        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
         log_parse_environment();
@@ -1035,71 +1078,9 @@ int main(int argc, char* argv[]) {
                 goto finish;
         }
 
-        r = discover_device();
-        if (r < 0)
-                goto finish;
-        if (!arg_mount_where) {
-                log_error("Can't figure out where to mount %s.", arg_mount_what);
-                r = -EINVAL;
-                goto finish;
-        }
-
-        path_kill_slashes(arg_mount_where);
-
-        if (path_equal(arg_mount_where, "/")) {
-                log_error("Refusing to operate on root directory.");
-                r = -EINVAL;
-                goto finish;
-        }
-
-        if (!path_is_safe(arg_mount_where)) {
-                log_error("Path is contains unsafe components.");
-                r = -EINVAL;
-                goto finish;
-        }
-
-        if (streq_ptr(arg_mount_type, "auto"))
-                arg_mount_type = mfree(arg_mount_type);
-        if (streq_ptr(arg_mount_options, "defaults"))
-                arg_mount_options = mfree(arg_mount_options);
-
-        if (!is_device_path(arg_mount_what))
-                arg_fsck = false;
-
-        if (arg_fsck && arg_mount_type && arg_transport == BUS_TRANSPORT_LOCAL) {
-                r = fsck_exists(arg_mount_type);
-                if (r < 0)
-                        log_warning_errno(r, "Couldn't determine whether fsck for %s exists, proceeding anyway.", arg_mount_type);
-                else if (r == 0) {
-                        log_debug("Disabling file system check as fsck for %s doesn't exist.", arg_mount_type);
-                        arg_fsck = false; /* fsck doesn't exist, let's not attempt it */
-                }
-        }
-
-        r = bus_connect_transport_systemd(arg_transport, arg_host, arg_user, &bus);
-        if (r < 0) {
-                log_error_errno(r, "Failed to create bus connection: %m");
-                goto finish;
-        }
-
-        switch (arg_action) {
-
-        case ACTION_MOUNT:
-        case ACTION_DEFAULT:
-                r = start_transient_mount(bus, argv + optind);
-                break;
-
-        case ACTION_AUTOMOUNT:
-                r = start_transient_automount(bus, argv + optind);
-                break;
-
-        default:
-                assert_not_reached("Unexpected action.");
-        }
+        r = systemd_mount_main(argc, argv);
 
 finish:
-        bus = sd_bus_flush_close_unref(bus);
-
         pager_close();
 
         free(arg_mount_what);
