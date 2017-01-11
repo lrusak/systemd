@@ -460,7 +460,7 @@ static int acquire_mount_where(struct udev_device *d) {
                 escaped = xescape(name, "\\");
                 if (!filename_is_valid(escaped))
                         return 0;
-                arg_mount_where = strjoin("/run/media/system/", escaped, NULL);
+                arg_mount_where = strjoin("/media/", escaped, NULL);
         } else
                 arg_mount_where = strdup(v);
 
